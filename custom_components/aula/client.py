@@ -4,18 +4,16 @@ import datetime
 import pytz
 from bs4 import BeautifulSoup
 import json, re
-from .const import (
-    API,
-    API_VERSION,
-    MIN_UDDANNELSE_API,
-    MEEBOOK_API,
-    SYSTEMATIC_API,
-    EASYIQ_API,
-)
-from homeassistant.exceptions import ConfigEntryNotReady
-
-_LOGGER = logging.getLogger(__name__)
-
+DOMAIN = "aula"
+API = "https://www.aula.dk/api/v"
+API_VERSION = "22"
+MIN_UDDANNELSE_API = "https://api.minuddannelse.net/aula"
+MEEBOOK_API = "https://app.meebook.com/aulaapi"
+SYSTEMATIC_API = "https://systematic-momo.dk/api/aula"
+EASYIQ_API = "https://api.easyiqcloud.dk/api/aula/"
+CONF_SCHOOLSCHEDULE = "schoolschedule"
+CONF_UGEPLAN = "ugeplan"
+CONF_MU_OPGAVER = "mu_opgaver"
 
 class Client:
     huskeliste = {}
@@ -469,6 +467,7 @@ class Client:
                 and "0004" not in self.widgets
                 and "0062" not in self.widgets
                 and "0001" not in self.widgets
+                and "0128" not in self.widgets
             ):
                 _LOGGER.error(
                     "You have enabled ugeplaner, but we cannot find any supported widgets (0029,0004,0001) in Aula."
@@ -478,7 +477,146 @@ class Client:
                     "Multiple sources for ugeplaner is untested and might cause problems."
                 )
 
+
             def ugeplan(week, thisnext):
+                if "0128" in self.widgets:
+                    token_response = self._session.get(
+                        f"https://www.aula.dk/api/v22/?method=aulaToken.getAulaToken&widgetId=0128",
+                        headers={
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+                            "Referer": "https://www.aula.dk/portal/"
+                        },
+                        verify=True
+                    )
+                    bearer_token = token_response.json()["data"]
+                    token = f"Bearer {bearer_token}"
+                    csrf_token = self._session.cookies.get_dict().get("Csrfp-Token", "")
+                    x_childfilter = ",".join(self._childuserids)
+                    x_login = self._username
+                    x_institutionfilter = ",".join(self._institutionProfiles)
+                    easyiq_headers = {
+                        "accept": "*/*",
+                        "accept-language": "en-US,en;q=0.9,da;q=0.8",
+                        "authorization": token,
+                        "content-length": "0",
+                        "origin": "https://skoleportal.easyiqcloud.dk",
+                        "pragma": "no-cache",
+                        "priority": "u=1, i",
+                        "referer": "https://skoleportal.easyiqcloud.dk/UgeplanWidget",
+                        "request-id": "",
+                        "sec-ch-ua": '"Not;A=Brand";v="99", "Google Chrome";v="139", "Chromium";v="139"',
+                        "sec-ch-ua-mobile": "?0",
+                        "sec-ch-ua-platform": '"Windows"',
+                        "sec-fetch-dest": "empty",
+                        "sec-fetch-mode": "cors",
+                        "sec-fetch-site": "same-origin",
+                        "sec-fetch-storage-access": "active",
+                        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
+                        "x-childfilter": x_childfilter,
+                        "x-institutionfilter": x_institutionfilter,
+                        "x-login": x_login,
+                        "x-requested-with": "XMLHttpRequest",
+                        "x-userprofile": "guardian",
+                    }
+                    AuthenticateAulaUser = self._session.post(
+                        "https://skoleportal.easyiqcloud.dk/Aula/AuthenticateAulaUser",
+                        headers=easyiq_headers,
+                        verify=True,
+                    )
+                    auth_data = json.loads(AuthenticateAulaUser.text)
+                    login_id = str(auth_data.get("loginId", ""))
+                    child_full_name = auth_data.get("childName", "")
+                    child_first_name = child_full_name.split()[0] if child_full_name else ""
+                    calendar_url = "https://skoleportal.easyiqcloud.dk/Calendar/CalendarGetWeekplanEvents"
+                    params = {
+                        "loginId": login_id,
+                        "date": datetime.datetime.now().strftime("%Y-%m-%dT00:00:00.000Z"),
+                        "activityFilter": "2127756",
+                    }
+                    calendar_headers = easyiq_headers.copy()
+                    calendar_headers["referer"] = "https://skoleportal.easyiqcloud.dk/UgeplanWidget"
+                    calendar_response = self._session.get(
+                        calendar_url,
+                        headers=calendar_headers,
+                        params=params,
+                        verify=True,
+                    )
+                    try:
+                        events = json.loads(calendar_response.text)
+                        # Danish day names
+                        days = ["Mandag", "Tirsdag", "Onsdag", "Torsdag", "Fredag", "Lørdag", "Søndag"]
+                        def get_dayname(date_str):
+                            # Try ISO 8601 first
+                            try:
+                                if date_str.endswith("Z"):
+                                    date_str = date_str[:-1]
+                                # Remove milliseconds if present
+                                if "." in date_str:
+                                    date_str = date_str.split(".")[0]
+                                dt = datetime.datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
+                                return days[dt.weekday()]
+                            except Exception:
+                                pass
+                            # Try Danish format: YYYY/MM/DD HH:MM
+                            try:
+                                dt = datetime.datetime.strptime(date_str, "%Y/%m/%d %H:%M")
+                                return days[dt.weekday()]
+                            except Exception:
+                                return "Ukendt dag"
+                        # Build markdown per child
+                        markdown = ""
+                        if isinstance(events, list) and len(events) > 0:
+                            # Group events by day
+                            events_by_day = {}
+                            for event in events:
+                                dayname = get_dayname(event.get("start", ""))
+                                if dayname not in events_by_day:
+                                    events_by_day[dayname] = []
+                                events_by_day[dayname].append(event)
+                            for day, day_events in events_by_day.items():
+                                markdown += f"## {day}\n"
+                                for event in day_events:
+                                    hold = event.get("activities", "")
+                                    fag = event.get("courses", "")
+                                    description = event.get("description", "")
+                                    title = event.get("title", "")
+                                    timestart = event.get("start", "")
+                                    timeend = event.get("end", "")
+                                    # Format time as HH:MM for both formats
+                                    def fmt_time(dtstr):
+                                        try:
+                                            if dtstr.endswith("Z"):
+                                                dtstr = dtstr[:-1]
+                                            if "." in dtstr:
+                                                dtstr = dtstr.split(".")[0]
+                                            # Try ISO
+                                            try:
+                                                dt = datetime.datetime.strptime(dtstr, "%Y-%m-%dT%H:%M:%S")
+                                                return dt.strftime("%H:%M")
+                                            except Exception:
+                                                pass
+                                            # Try Danish
+                                            dt = datetime.datetime.strptime(dtstr, "%Y/%m/%d %H:%M")
+                                            return dt.strftime("%H:%M")
+                                        except Exception:
+                                            return ""
+                                    markdown += f"**{title}**\n"
+                                    markdown += f"- Hold: {hold}\n"
+                                    markdown += f"- Fag: {fag}\n"
+                                    markdown += f"- Starttid: {fmt_time(timestart)}\n"
+                                    markdown += f"- Sluttid: {fmt_time(timeend)}\n"
+                                    markdown += f"- {description}\n\n"
+                        # Store markdown in self.ugep_attr/self.ugepnext_attr
+                        if thisnext == "this":
+                            self.ugep_attr[child_first_name] = markdown
+                        elif thisnext == "next":
+                            self.ugepnext_attr[child_first_name] = markdown
+                        _LOGGER.debug(f"0128 ugeplan markdown ({thisnext}, week={week}): {markdown}")
+                    except Exception as e:
+                        _LOGGER.error(f"Failed to format CalendarGetWeekplanEvents response: {e}")
+                        _LOGGER.debug("CalendarGetWeekplanEvents response: " + str(calendar_response.text))
+
+
                 if "0029" in self.widgets:
                     token = self.get_token("0029")
                     get_payload = (
@@ -583,7 +721,7 @@ class Client:
                                     "Could not parse timestamp: " + str(date_string)
                                 )
                                 return False
-                        try:        
+                        try:
                             for i in ugeplaner.json()["Events"]:
                                 if is_correct_format(i["start"], "%Y/%m/%d %H:%M"):
                                     _LOGGER.debug("No Event")
@@ -626,7 +764,7 @@ class Client:
                                     _LOGGER.debug("None")
                         except KeyError:
                             _LOGGER.debug("None")
-        
+
                         if thisnext == "this":
                             self.ugep_attr[first_name] = _ugep
                         elif thisnext == "next":
